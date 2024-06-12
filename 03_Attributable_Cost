@@ -1,0 +1,167 @@
+######################################################################=#
+# PURPOSE: Calculate attributable cost and case
+# PAPER: Nature Communication (2024)
+# Programmer: Jinah Park from Seoul National University
+# Program: R
+######################################################################=#
+
+# ============================================================================ #
+# STEP 1: NATIONAL SCALE => DAILY COUNT & COST DATA & TEMP? CASE DAY'S MEAN TEMP => TSA DATA
+# STEP 2: MATCH EACH DAY'S Odds Ratio DEPENDING ON THAT DAY'S TEMP
+# STEP 3: CALCULATE ATTRIBUTABLE CASE AND COST
+# ============================================================================ #
+
+setwd("Z:/heat-ED")
+source("attrdl.R") # This function was made by A. Gasparrini
+
+library(lubridate); library(data.table); library(dplyr); library(readxl)
+library(tsModel); library(dlnm); library(survival); library(MASS)
+
+
+#=############################################################################=#
+### 1. MAKE TSA DATA ###########################################################
+#=############################################################################=#
+load("00_DBsave_R/240524_PwD+PwoD_matched2.RData")
+dat_non <- dat_type_matched[[1]] %>% mutate(month=month(MATCHED_DATE)) %>%
+  filter(month %in% 6:9 & CASE_YN==1 & DSB==0) %>% 
+  dplyr::select(c(ID, MATCHED_DATE,price_1000USD,
+           sick,SEX_TYPE,senior,DENS_rank,ur,incomeLv))
+
+dat_type <- dat_type_matched %>% lapply(function(x){
+  x <- x %>% mutate(month=month(MATCHED_DATE)) %>%
+    filter(month %in% 6:9 & CASE_YN==1 & DSB==1) %>% 
+    dplyr::select(c(ID, MATCHED_DATE,price_1000USD,
+                    sick,SEX_TYPE,senior,DENS_rank,ur,incomeLv))
+  return(x)
+})
+rm(dat_type_matched)
+
+load("temp0621_percentile_REV.RData") %>% data.table()
+temp0621 <- temp0621_0609; rm(temp0621_0609, temp0621_0509)
+temp0621$DATE<- as.Date(temp0621$date)
+frame <- temp0621 %>% group_by(date) %>% summarise(rank_all=mean(temp_rank)) %>% unique()
+rm(temp0621)
+nsim <- 1000
+
+
+################################################################################
+### 2. CALCULATE AF, AN, A_COST ################################################
+#=############################################################################=#
+## 1) ALL DSB TYPE + ALL DEMO + ALL CAUSE =============================================
+load("Results/analysis_result/list1_v2.RData")
+dat_type1 <- dat_type %>% lapply(function(x){
+  x <- data.table(x)
+  x <- x %>% group_by(MATCHED_DATE) %>%
+    summarise(case=n(), money=sum(price_1000USD))
+  x <- frame %>% left_join(x, by=c("date"="MATCHED_DATE")) #%>% select(c(date, case, money, rank_all))
+  x$case[is.na(x$case)] <- 0; x$money[is.na(x$money)] <- 0
+  return(x)
+})
+names(dat_type1) <- names(dat_type)
+
+result = data.frame(population = names(dat_type1),
+                    attr_case = NA, case_LB=NA, case_UB=NA,
+                    attr_cost=NA, cost_LB=NA, cost_UB=NA)
+
+for(i in seq(length(dat_type1))){
+  #i=1
+  data = dat_type1[[i]]
+  arraysim_cost <- data.frame(sim=1:nsim, attr_cost=NA)
+  arraysim_case <- data.frame(sim=1:nsim, attr_case=NA)
+ 
+  set.seed(960823)
+  # [eCI] --------------------------- @
+  arraysim_case[,2] = attrdl(data$rank_all, cb_list1[[i]], data$case,
+                        coef = coef_list1[i,], vcov = vcov_list1[[i]],
+                        type = "an", dir = "forw",
+                        cen = t75_list1[i,1], range = c(t75_list1[i,1],100), sim=T, nsim=nsim)
+  
+  arraysim_cost[,2] = attrdl(data$rank_all, cb_list1[[i]], data$money,
+               coef = coef_list1[i,], vcov = vcov_list1[[i]],
+               type = "an", dir = "forw",
+               cen = t75_list1[i,1], range = c(t75_list1[i,1],100), sim=T, nsim=nsim)
+
+  # [data merge] --------------------------- @
+  result[i,"attr_case"] = mean(arraysim_case$attr_case, na.rm=T)/(2021-2006+1)
+  result[i,"case_LB"] = quantile(arraysim_case$attr_case, 2.5/100, na.rm=T)/(2021-2006+1)
+  result[i,"case_UB"] = quantile(arraysim_case$attr_case, 97.5/100, na.rm=T)/(2021-2006+1)
+  
+  result[i,"attr_cost"] = mean(arraysim_cost$attr_cost, na.rm=T)/(2021-2006+1)
+  result[i,"cost_LB"] = quantile(arraysim_cost$attr_cost, 2.5/100, na.rm=T)/(2021-2006+1)
+  result[i,"cost_UB"] = quantile(arraysim_cost$attr_cost, 97.5/100, na.rm=T)/(2021-2006+1)
+  
+  print(names(dat_type)[i])
+}
+fwrite(result, file="Results/Revision/240531_attr1.csv")
+rm(cb_list1, coef_list1, dat_type1, t75_list1, vcov_list1)
+rm(result,arraysim_cost,arraysim_case,data)
+
+
+## 2) ALL DSB TYPE + ALL DEMO + CAUSE-SPECIFIC =============================================
+load("Results/analysis_result/list2_v2.RData")
+dat_type2 <- vector("list")
+cause <- c("I", "N", "F", "J")
+cause_nm <- c("Cardiovascular", "Genitourinary", "Mental", "Respiratory")
+rtable <- data.frame(population=rep(names(dat_type), each=4),
+                      cause_of_visit=cause_nm)
+NMlist <- paste(rtable$population, rtable$cause_of_visit, sep="_"); rm(rtable)
+
+for(i in seq(length(dat_type))){
+  x <- dat_type[[i]]
+  x <- x %>% group_by(MATCHED_DATE, sick) %>%
+    summarise(case=n(), money=sum(price_1000USD))
+  x <- frame %>% left_join(x, by=c("date"="MATCHED_DATE"))
+  x$case[is.na(x$case)] <- 0; x$money[is.na(x$money)] <- 0
+  
+  x1 <- x %>% filter(sick==cause[1])
+  x2 <- x %>% filter(sick==cause[2])
+  x3 <- x %>% filter(sick==cause[3])
+  x4 <- x %>% filter(sick==cause[4])
+  
+  dat_type2[[(i-1)*4+1]] <- x1
+  dat_type2[[(i-1)*4+2]] <- x2
+  dat_type2[[(i-1)*4+3]] <- x3
+  dat_type2[[(i-1)*4+4]] <- x4
+  
+  rm(x1, x2, x3, x4, x)
+}
+names(dat_type2) <- NMlist; rm(NMlist)
+
+
+result = data.frame(population = names(dat_type2),
+                    attr_case = NA, case_LB=NA, case_UB=NA,
+                    attr_cost=NA, cost_LB=NA, cost_UB=NA)
+
+for(i in seq(length(dat_type2))){
+  #i=1
+  data = dat_type2[[i]]
+  arraysim_cost <- data.frame(sim=1:nsim, attr_cost=NA)
+  arraysim_case <- data.frame(sim=1:nsim, attr_case=NA)
+  
+  set.seed(960823)
+  # [eCI] --------------------------- @
+  arraysim_case[,2] = attrdl(data$rank_all, cb_list2[[i]], data$case,
+                             coef = coef_list2[i,], vcov = vcov_list2[[i]],
+                             type = "an", dir = "forw",
+                             cen = t75_list2[i,1], range = c(t75_list2[i,1],100), sim=T, nsim=nsim)
+  
+  arraysim_cost[,2] = attrdl(data$rank_all, cb_list2[[i]], data$money,
+                             coef = coef_list2[i,], vcov = vcov_list2[[i]],
+                             type = "an", dir = "forw",
+                             cen = t75_list2[i,1], range = c(t75_list2[i,1],100), sim=T, nsim=nsim)
+  
+  # [data merge] --------------------------- @
+  result[i,"attr_case"] = mean(arraysim_case$attr_case, na.rm=T)/(2021-2006+1)
+  result[i,"case_LB"] = quantile(arraysim_case$attr_case, 2.5/100, na.rm=T)/(2021-2006+1)
+  result[i,"case_UB"] = quantile(arraysim_case$attr_case, 97.5/100, na.rm=T)/(2021-2006+1)
+  
+  result[i,"attr_cost"] = mean(arraysim_cost$attr_cost, na.rm=T)/(2021-2006+1)
+  result[i,"cost_LB"] = quantile(arraysim_cost$attr_cost, 2.5/100, na.rm=T)/(2021-2006+1)
+  result[i,"cost_UB"] = quantile(arraysim_cost$attr_cost, 97.5/100, na.rm=T)/(2021-2006+1)
+  
+  print(names(dat_type2)[i])
+}
+
+fwrite(result, file="Results/Revision/240531_attr2.csv")
+rm(cb_list2, coef_list2, dat_type2, t75_list2, vcov_list2)
+rm(result,arraysim_cost,arraysim_case,data)
