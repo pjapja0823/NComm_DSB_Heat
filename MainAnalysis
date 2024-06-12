@@ -1,0 +1,1063 @@
+# aim: analysis code for individual CCO with customized data set
+# => FINAL DB, ANALYSIS VERSION!
+# date: 2024-05-24
+# author: JP
+# MODEL: individual level case-crossover
+# PAPER: Disability & ED visits (Heat short-term effect)
+######################################################################=#
+setwd("Z:/heat-ED")
+library(lubridate); library(data.table); library(dplyr); library(readxl)
+library(tsModel); library(dlnm); library(survival); library(splines)
+
+load("00_DBsave_R/240524_PwD+PwoD_matched2.RData")
+
+# [SEPARATE RESULT TABLE] ----- #
+dat_type <- dat_type_matched %>% lapply(function(x){
+  x <- x %>% mutate(month=month(MATCHED_DATE)) %>% filter(month %in% 6:9) %>% select(-month)
+  x <- x %>% select(c(ID, CASE_YN, sick, SEX_TYPE, MAIN_DSB_TYPE, sgg_b, MATCHED_DATE, holiday,
+                      ur, DENS_rank, num_dr:senior, sick_detail:nonDSB))
+  x$holiday <- as.factor(x$holiday)
+  return(x)
+}); rm(dat_type_matched)
+
+## TEMPERATURE DATA LOAD ----------------------------------
+load("temp0621_percentile_REV.RData") %>% data.table()
+temp0621 <- temp0621_0609; rm(temp0621_0609, temp0621_0509)
+temp0621$date <- as.Date(temp0621$date)
+
+# APPLY LAG TEMPERATURE
+temp0621 <- temp0621 %>% mutate(year=year(date),
+                                lag1_temp=temp_rank %>% Lag(1, group=list(sgg_b,year)),
+                                lag2_temp=temp_rank %>% Lag(2, group=list(sgg_b,year)),
+                                lag3_temp=temp_rank %>% Lag(3, group=list(sgg_b,year)),
+                                lag4_temp=temp_rank %>% Lag(4, group=list(sgg_b,year)),
+                                lag5_temp=temp_rank %>% Lag(5, group=list(sgg_b,year))) %>%
+  select(-year) %>% rename(lag0_temp=temp_rank)
+temp0621 <- temp0621 %>% select(-c(sido_b, sgg_h:tmean))
+
+varfun<-"ns"; vardf<-4 ; lagknots<-c(1,3) #among lag days
+
+
+## PRECIPITATION DATA LOAD ----------------------------------
+load("meteo(preci+rhum).RData")
+
+#=############################################################################=#
+## 2. DLNM APPLICATION #########################################################
+#=############################################################################=#
+## 1) TOTAL CAUSE, TOTAL POP (MAIN + SUB1) =====================================
+rtable1 <- data.frame(population=names(dat_type),
+                      cause_of_visit="All cause", expo="lag 0-5",
+                      RR=NA, RR_low=NA, RR_high=NA,
+                      ROR=NA, ROR_low=NA, ROR_high=NA)
+
+vcov_list1 <- cb_list1 <- vector("list", length=length(dat_type))
+coef_list1 <- matrix(NA, nrow=length(dat_type), ncol=vardf)
+t75_list1 <- matrix(NA, nrow=length(dat_type), ncol=1)
+rownames(t75_list1) <- rownames(coef_list1) <- names(vcov_list1) <- names(cb_list1) <- names(dat_type)
+
+# FOR WHOLE --------------- #
+# vcov_list_tot <- cb_list_tot <- vector("list", length=1)
+# coef_list_tot <- matrix(NA, nrow=1, ncol=vardf)
+# t75_list_tot <- matrix(NA, nrow=1, ncol=1)
+# rownames(t75_list_tot) <- rownames(coef_list_tot) <- names(vcov_list_tot) <- names(cb_list_tot) <- "Total"
+# ----------------------------- #
+
+# FOR PwoD --------------- #
+vcov_list_pwod <- cb_list_pwod <- vector("list", length=1)
+coef_list_pwod <- matrix(NA, nrow=1, ncol=vardf)
+t75_list_pwod <- matrix(NA, nrow=1, ncol=1)
+rownames(t75_list_pwod) <- rownames(coef_list_pwod) <- names(vcov_list_pwod) <- names(cb_list_pwod) <- "pwodal"
+# ----------------------------- #
+
+
+# [CONDUCT ANALYSIS] ----- #
+for (i in 2:(length(dat_type))){ #each disability type
+  cat(names(dat_type)[i])
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  
+  tsub <- ldat %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+  cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+  rm(tsub); gc()
+  
+  predvar<-quantile(ldat$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+  bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+  ldat <- ldat %>%
+    select(c(ID, CASE_YN, lag0_temp, nonDSB, DSB, ur, DENS_rank, num_dr, num_bed, unmet, medicaid, insu_rank2, rhum, holiday))
+  
+  ## [1. GET RR] ====================================================== @
+  int1 <- cb*ldat$nonDSB
+  model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  
+  red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+  pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                  cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
+  rm(int1, model)
+  
+  # EXTRACT RR / coef/vcov ---- #
+  rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+  rtable1[i,4:6] <-rr
+  
+  # EXTRACT COEF/VCOV for ATTR ---- #
+  coef_list1[i,] <- coef(red); vcov_list1[[i]] <- vcov(red); cb_list1[[i]] <- cb
+  t75_list1[i,] <- quantile(ldat$lag0_temp,75/100, na.rm=T)
+  
+  # coef_list_tot[i,] <- coef(red); vcov_list_tot[[i]] <- vcov(red); cb_list_tot[[i]] <- cb
+  # t75_list_tot[i,] <- quantile(ldat$lag0_temp,75/100, na.rm=T)
+
+    
+  ## [2. GET ROR] ====================================================== @
+  int1 <- cb*ldat$DSB
+  model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  
+  red<-crossreduce(int1,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+  pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                  cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
+  
+  # EXTRACT RR / coef/vcov ---- #
+  rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+  rtable1[i,7:9] <-rr
+  
+  
+  ## [PwoD RR] ----------------------- @
+  # red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+  # pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+  #                 cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
+  # rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+  # rtable1[i,10:12] <-rr
+  # rm(int1, model)
+  
+  # coef_list_pwod[i,] <- coef(red); vcov_list_pwod[[i]] <- vcov(red)
+  # cb_list_pwod[[i]] <- cb
+  # t75_list_pwod[i,] <- quantile(ldat$lag0_temp,75/100, na.rm=T)
+}
+
+rm(cb, predvar, bvar, red, pred, rr, int1, model)
+fwrite(rtable1, "Results/Revision/240528_RRTABLE1.csv")
+#fwrite(rtable1, "Results/Revision/240528_RRTABLE1_tot.csv")
+save(coef_list1, vcov_list1, cb_list1, t75_list1, file="Results/analysis_result/list1_v2.RData")
+rm(coef_list1, vcov_list1, cb_list1, t75_list1)
+
+# save(coef_list_tot, vcov_list_tot, cb_list_tot, t75_list_tot, file="Results/analysis_result/list_tot_v2_total.RData")
+# rm(coef_list_tot, vcov_list_tot, cb_list_tot, t75_list_tot)
+save(coef_list_pwod, vcov_list_pwod, cb_list_pwod, t75_list_pwod, file="Results/analysis_result/list_tot_pwod.RData")
+rm(coef_list_pwod, vcov_list_pwod, cb_list_pwod, t75_list_pwod)
+gc()
+
+
+## 2-1) CAUSE SPECIFIC : BIG ==========================
+cause <- c("I", "N", "F", "J")
+cause_nm <- c("Cardiovascular", "Genitourinary", "Mental", "Respiratory")
+rtable2 <- data.frame(population=rep(names(dat_type), each=4),
+                      cause_of_visit=cause_nm, expo="lag 0-5",
+                      RR=NA, RR_low=NA, RR_high=NA,
+                      ROR=NA, ROR_low=NA, ROR_high=NA)
+
+NMlist <- paste(rtable2$population, rtable2$cause_of_visit, sep="_")
+
+vcov_list2 <- cb_list2 <- vector("list", length=length(dat_type)*4)
+coef_list2 <- matrix(NA, nrow=length(dat_type)*4, ncol=vardf)
+t75_list2 <- matrix(NA, nrow=length(dat_type)*4, ncol=1)
+rownames(t75_list2) <- rownames(coef_list2) <- names(vcov_list2) <- names(cb_list2) <- NMlist
+#load("Results/analysis_result/list2_v2.RData")
+
+vcov_list2_pwod <- cb_list2_pwod <- vector("list", length=length(cause))
+coef_list2_pwod <- matrix(NA, nrow=length(cause), ncol=vardf)
+t75_list2_pwod <- matrix(NA, nrow=length(cause), ncol=1)
+rownames(t75_list2_pwod) <- rownames(coef_list2_pwod) <- names(vcov_list2_pwod) <- names(cb_list2_pwod) <- cause_nm
+
+
+for (i in 2:(length(dat_type))){
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  
+  for (m in seq(length(cause))){
+    ldat2 <- ldat %>% filter(sick==cause[m])
+    tsub <- ldat2 %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+    tknots <- quantile(ldat2$lag0_temp, c(25,50,75)/100, na.rm=T)
+    cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+    rm(tsub); gc()
+    
+    predvar<-quantile(ldat2$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+    bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+    
+    ## [1. GET RR] ====================================================== @
+    int1 <- cb*ldat2$nonDSB
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rm(int1, model)
+
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable2[(i-1)*4+m,4:6] <-rr
+
+    # EXTRACT COEF/VCOV for ATTR ---- #
+    coef_list2[(i-1)*4+m,] <- coef(red); vcov_list2[[(i-1)*4+m]] <- vcov(red); cb_list2[[(i-1)*4+m]] <- cb
+    t75_list2[(i-1)*4+m,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    
+    
+    ## [2. GET ROR] ====================================================== @
+    int1 <- cb*ldat2$DSB
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable2[(i-1)*4+m,7:9] <-rr
+    
+    
+    ## [PwoD RR] ----------------------- @
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable2[(i-1)*4+m,10:12] <-rr
+
+    coef_list2_pwod[(i-1)*4+m,] <- coef(red); vcov_list2_pwod[[(i-1)*4+m]] <- vcov(red); cb_list2_pwod[[(i-1)*4+m]] <- cb
+    t75_list2_pwod[(i-1)*4+m,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    rm(int1, model)
+  }
+}
+
+rm(cause, cause_nm, ldat2, cb, predvar, bvar, red, pred, rr)
+#fwrite(rtable2, "Results/Revision/240528_RRTABLE2.csv")
+save(coef_list2, vcov_list2, cb_list2, t75_list2, file="Results/analysis_result/list2_v2.RData")
+rm(coef_list2, vcov_list2, cb_list2, t75_list2); gc()
+
+fwrite(rtable2, "Results/Revision/240531_RRTABLE2_pwod.csv")
+save(coef_list2_pwod, vcov_list2_pwod, cb_list2_pwod, t75_list2_pwod, file="Results/analysis_result/list2_v2_pwod.RData")
+rm(coef_list2_pwod, vcov_list2_pwod, cb_list2_pwod, t75_list2_pwod); gc()
+
+
+## 2-2) DZ: SPECIFIC =================================================
+cause2 <- unique(dat_type[[1]]$sick_detail) %>% sort()
+rtable2 <- data.frame(population=rep(names(dat_type), each=length(cause2)),
+                      cause_of_visit=cause2, expo="lag 0-5",
+                      RR=NA, RR_low=NA, RR_high=NA,
+                      ROR=NA, ROR_low=NA, ROR_high=NA)
+
+#for (i in seq(length(dat_type))){
+for (i in c(7)){
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  cat(names(dat_type)[[i]], "================", "\n")
+  
+  for (m in seq(length(cause2))){
+  #for (m in c(1:12, 14:length(cause2))){
+  #for (m in 13){
+    cat(m, "-", cause2[[m]], "/")
+    ldat2 <- ldat %>% filter(sick_detail==cause2[m])
+    tsub <- ldat2 %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+    tknots <- quantile(ldat2$lag0_temp, c(25,50,75)/100, na.rm=T)
+    cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+    rm(tsub); gc()
+    
+    predvar<-quantile(ldat2$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+    bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+    
+    ## [1. GET RR] ====================================================== @
+    int1 <- cb*ldat2$nonDSB
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T)); rm(int1, model)
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable2[(i-1)*length(cause2)+m,4:6] <-rr
+    
+    
+    ## [2. GET ROR] ====================================================== @
+    int1 <- cb*ldat2$DSB
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T)); rm(int1, model)
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable2[(i-1)*length(cause2)+m,7:9] <-rr
+  }
+}
+
+rm(cause2, coef, vcov, i, m, predvar, pred, red, model, ldat, ldat2, rr, tsub, NMlist)
+fwrite(rtable2, "Results/Revision/240531_RRTABLE2_dz.csv")
+
+
+## 3) SEX/GENDER/UrbanRural/Income SUBGROUP ==========================
+# (1) SEX SUB ----------------------------------------
+dem <- c("Male", "Female")
+rtable4 <- data.frame(population=rep(names(dat_type), each=length(dem)),
+                      demo=dem, cause_of_visit="All cause", 
+                      RR=NA, RR_low=NA, RR_high=NA,
+                      ROR=NA, ROR_low=NA, ROR_high=NA)
+
+NMlist <- paste(rtable4$population, rtable4$demo, sep="_")
+vcov_list3 <- cb_list3 <- vector("list", length=length(dat_type)*length(dem))
+coef_list3 <- matrix(NA, nrow=length(dat_type)*length(dem), ncol=vardf)
+t75_list3 <- matrix(NA, nrow=length(dat_type)*length(dem), ncol=1)
+rownames(t75_list3) <- rownames(coef_list3) <- names(vcov_list3) <- names(cb_list3) <- NMlist
+
+# load("Results/analysis_result/list3_sex.RData")
+# vcov_list3_pwod <- cb_list3_pwod <- vector("list", length=length(dem))
+# coef_list3_pwod <- matrix(NA, nrow=length(dem), ncol=vardf)
+# t75_list3_pwod <- matrix(NA, nrow=length(dem), ncol=1)
+# rownames(t75_list3_pwod) <- rownames(coef_list3_pwod) <- names(vcov_list3_pwod) <- names(cb_list3_pwod) <- dem
+
+# i=1? PwoD run!
+for (i in 2:(length(dat_type))){
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>%
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  cat(names(dat_type)[[i]])
+  
+  for (k in seq(length(dem))){
+    ldat2 <- ldat %>% filter(SEX_TYPE==k)
+    tsub <- ldat2 %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+    tknots <- quantile(ldat2$lag0_temp, c(25,50,75)/100, na.rm=T)
+    cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+    rm(tsub); gc()
+    
+    predvar<-quantile(ldat2$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+    bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+    
+    ## [1. GET RR] ====================================================== @
+    int1 <- cb*ldat2$nonDSB
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rm(int1, model)
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4[(i-1)*length(dem)+k, 4:6] <-rr
+    
+    # EXTRACT COEF/VCOV for ATTR ---- #
+    coef_list3[(i-1)*length(dem)+k,] <- coef(red); vcov_list3[[(i-1)*length(dem)+k]] <- vcov(red)
+    cb_list3[[(i-1)*length(dem)+k]] <- cb
+    t75_list3[(i-1)*length(dem)+k,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    
+    
+    ## [2. GET ROR] ====================================================== @
+    int1 <- cb*ldat2$DSB
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4[(i-1)*length(dem)+k,7:9] <-rr
+    
+    ## [PwoD RR] ----------------------- @
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4[(i-1)*length(dem)+k,10:12] <-rr
+
+    coef_list3_pwod[(i-1)*length(dem)+k,] <- coef(red); vcov_list3_pwod[[(i-1)*length(dem)+k]] <- vcov(red)
+    cb_list3_pwod[[(i-1)*length(dem)+k]] <- cb
+    t75_list3_pwod[(i-1)*length(dem)+k,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    rm(int1, model)
+  }
+}
+rm(ldat2, cb, predvar, bvar, red, pred, rr)
+
+fwrite(rtable4, "Results/Revision/240528_RRTABLE4_sex.csv")
+fwrite(rtable4, "Results/Revision/240531_RRTABLE4_sex_pwod.csv")
+save(coef_list3, vcov_list3, cb_list3, t75_list3, file="Results/analysis_result/list3_sex.RData")
+rm(coef_list3, vcov_list3, cb_list3, t75_list3)
+gc()
+
+# save(coef_list3_pwod, vcov_list3_pwod, cb_list3_pwod, t75_list3_pwod, file="Results/analysis_result/list3_sex_pwod.RData")
+# rm(coef_list3_pwod, vcov_list3_pwod, cb_list3_pwod, t75_list3_pwod)
+
+
+# (2) AGE SUB ===========================================
+dem <- c("Young", "Senior")
+rtable4_2 <- data.frame(population=rep(names(dat_type), each=length(dem)),
+                      demo=dem, cause_of_visit="All cause", 
+                      RR=NA, RR_low=NA, RR_high=NA,
+                      ROR=NA, ROR_low=NA, ROR_high=NA)
+
+NMlist <- paste(rtable4_2$population, rtable4_2$demo, sep="_")
+vcov_list3 <- cb_list3 <- vector("list", length=length(dat_type)*length(dem))
+coef_list3 <- matrix(NA, nrow=length(dat_type)*length(dem), ncol=vardf)
+t75_list3 <- matrix(NA, nrow=length(dat_type)*length(dem), ncol=1)
+rownames(t75_list3) <- rownames(coef_list3) <- names(vcov_list3) <- names(cb_list3) <- NMlist
+
+# load("Results/analysis_result/list3_age.RData")
+# vcov_list3_pwod <- cb_list3_pwod <- vector("list", length=length(dem))
+# coef_list3_pwod <- matrix(NA, nrow=length(dem), ncol=vardf)
+# t75_list3_pwod <- matrix(NA, nrow=length(dem), ncol=1)
+# rownames(t75_list3_pwod) <- rownames(coef_list3_pwod) <- names(vcov_list3_pwod) <- names(cb_list3_pwod) <- dem
+
+
+# i=1? PwoD run!
+for (i in 2:(length(dat_type))){
+  ldat <- dat_type[[i]] 
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  cat(names(dat_type)[[i]])
+  
+  for (k in seq(length(dem))){
+    ldat2 <- ldat %>% filter(senior==dem[k])
+    tsub <- ldat2 %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+    tknots <- quantile(ldat2$lag0_temp, c(25,50,75)/100, na.rm=T)
+    cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+    rm(tsub); gc()
+    
+    predvar<-quantile(ldat2$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+    bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+    
+    ## [1. GET RR] ====================================================== @
+    int1 <- cb*ldat2$nonDSB
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rm(int1, model)
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_2[(i-1)*length(dem)+k, 4:6] <-rr
+    
+    # EXTRACT COEF/VCOV for ATTR ---- #
+    coef_list3[(i-1)*length(dem)+k,] <- coef(red); vcov_list3[[(i-1)*length(dem)+k]] <- vcov(red)
+    cb_list3[[(i-1)*length(dem)+k]] <- cb
+    t75_list3[(i-1)*length(dem)+k,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    
+    
+    ## [2. GET ROR] ====================================================== @
+    int1 <- cb*ldat2$DSB
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_2[(i-1)*length(dem)+k,7:9] <-rr
+    
+    ## [PwoD RR] ----------------------- @
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_2[(i-1)*length(dem)+k,10:12] <-rr
+    coef_list3_pwod[(i-1)*length(dem)+k,] <- coef(red); vcov_list3_pwod[[(i-1)*length(dem)+k]] <- vcov(red)
+    cb_list3_pwod[[(i-1)*length(dem)+k]] <- cb
+    t75_list3_pwod[(i-1)*length(dem)+k,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    rm(int1, model)
+  }
+}
+rm(ldat2, cb, predvar, bvar, red, pred, rr)
+save(coef_list3, vcov_list3, cb_list3, t75_list3, file="Results/analysis_result/list3_age.RData")
+fwrite(rtable4_2, "Results/Revision/240528_RRTABLE4_age.csv")
+#fwrite(rtable4_2, "Results/Revision/240531_RRTABLE4_age_pwod.csv")
+rm(coef_list3, vcov_list3, cb_list3, t75_list3)
+
+# save(coef_list3_pwod, vcov_list3_pwod, cb_list3_pwod, t75_list3_pwod, file="Results/analysis_result/list3_age_pwod.RData")
+# rm(coef_list3_pwod, vcov_list3_pwod, cb_list3_pwod, t75_list3_pwod)
+
+
+# (3) POP_DEN SUB ----------------------------------
+dem <- c("Q1", "Q2", "Q3")
+rtable4_3 <- data.frame(population=rep(names(dat_type), each=length(dem)),
+                      demo=dem, cause_of_visit="All cause", 
+                      RR=NA, RR_low=NA, RR_high=NA,
+                      ROR=NA, ROR_low=NA, ROR_high=NA)
+
+NMlist <- paste(rtable4_3$population, rtable4_3$demo, sep="_")
+vcov_list3 <- cb_list3 <- vector("list", length=length(dat_type)*length(dem))
+coef_list3 <- matrix(NA, nrow=length(dat_type)*length(dem), ncol=vardf)
+t75_list3 <- matrix(NA, nrow=length(dat_type)*length(dem), ncol=1)
+rownames(t75_list3) <- rownames(coef_list3) <- names(vcov_list3) <- names(cb_list3) <- NMlist
+
+# load("Results/analysis_result/list3_ur.RData")
+# vcov_list3_pwod <- cb_list3_pwod <- vector("list", length=length(dem))
+# coef_list3_pwod <- matrix(NA, nrow=length(dem), ncol=vardf)
+# t75_list3_pwod <- matrix(NA, nrow=length(dem), ncol=1)
+# rownames(t75_list3_pwod) <- rownames(coef_list3_pwod) <- names(vcov_list3_pwod) <- names(cb_list3_pwod) <- dem
+
+
+
+for (i in 2:(length(dat_type))){
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  cat(names(dat_type)[[i]])
+  
+  for (k in seq(length(dem))){
+    cat(dem[[k]])
+    ldat2 <- ldat %>% filter(DENS_rank==dem[k])
+    tsub <- ldat2 %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+    tknots <- quantile(ldat2$lag0_temp, c(25,50,75)/100, na.rm=T)
+    cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+    rm(tsub); gc()
+    
+    predvar<-quantile(ldat2$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+    bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+    
+    ## [1. GET RR] ====================================================== @
+    int1 <- cb*ldat2$nonDSB
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rm(int1, model)
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_3[(i-1)*length(dem)+k, 4:6] <-rr
+    
+    # EXTRACT COEF/VCOV for ATTR ---- #
+    coef_list3[(i-1)*length(dem)+k,] <- coef(red); vcov_list3[[(i-1)*length(dem)+k]] <- vcov(red)
+    cb_list3[[(i-1)*length(dem)+k]] <- cb
+    t75_list3[(i-1)*length(dem)+k,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    
+    
+    ## [2. GET ROR] ====================================================== @
+    int1 <- cb*ldat2$DSB
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_3[(i-1)*length(dem)+k,7:9] <-rr
+    
+    ## [PwoD RR] ----------------------- @
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_3[(i-1)*length(dem)+k,10:12] <-rr
+
+    coef_list3_pwod[(i-1)*length(dem)+k,] <- coef(red); vcov_list3_pwod[[(i-1)*length(dem)+k]] <- vcov(red)
+    cb_list3_pwod[[(i-1)*length(dem)+k]] <- cb
+    t75_list3_pwod[(i-1)*length(dem)+k,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    rm(int1, model)
+  }
+}
+rm(ldat2, cb, predvar, bvar, red, pred, rr)
+save(coef_list3, vcov_list3, cb_list3, t75_list3, file="Results/analysis_result/list3_ur.RData")
+fwrite(rtable4_3, "Results/Revision/240524_RRTABLE4_ur.csv")
+#fwrite(rtable4_3, "Results/Revision/240531_RRTABLE4_ur_pwod.csv")
+
+# save(coef_list3_pwod, vcov_list3_pwod, cb_list3_pwod, t75_list3_pwod, file="Results/analysis_result/list3_ur_pwod.RData")
+# rm(coef_list3_pwod, vcov_list3_pwod, cb_list3_pwod, t75_list3_pwod)
+
+
+# (4) INCOME SUB ----------------------------------
+dem <- c("Low", "Middle", "High")
+rtable4_4 <- data.frame(population=rep(names(dat_type), each=length(dem)),
+                      demo=dem, cause_of_visit="All cause", 
+                      RR=NA, RR_low=NA, RR_high=NA,
+                      ROR=NA, ROR_low=NA, ROR_high=NA)
+
+NMlist <- paste(rtable4_4$population, rtable4_4$demo, sep="_")
+vcov_list3 <- cb_list3 <- vector("list", length=length(dat_type)*length(dem))
+coef_list3 <- matrix(NA, nrow=length(dat_type)*length(dem), ncol=vardf)
+t75_list3 <- matrix(NA, nrow=length(dat_type)*length(dem), ncol=1)
+rownames(t75_list3) <- rownames(coef_list3) <- names(vcov_list3) <- names(cb_list3) <- NMlist
+
+# load("Results/analysis_result/list3_income.RData")
+# vcov_list3_pwod <- cb_list3_pwod <- vector("list", length=length(dem))
+# coef_list3_pwod <- matrix(NA, nrow=length(dem), ncol=vardf)
+# t75_list3_pwod <- matrix(NA, nrow=length(dem), ncol=1)
+# rownames(t75_list3_pwod) <- rownames(coef_list3_pwod) <- names(vcov_list3_pwod) <- names(cb_list3_pwod) <- dem
+
+
+for (i in 2:(length(dat_type))){
+  ldat <- dat_type[[i]] 
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  cat(names(dat_type)[[i]])
+  
+  for (k in seq(length(dem))){
+    ldat2 <- ldat %>% filter(incomeLv==dem[k])
+    tsub <- ldat2 %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+    tknots <- quantile(ldat2$lag0_temp, c(25,50,75)/100, na.rm=T)
+    cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+    rm(tsub); gc()
+    
+    predvar<-quantile(ldat2$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+    bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+    
+    ## [1. GET RR] ====================================================== @
+    int1 <- cb*ldat2$nonDSB
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rm(int1, model)
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_4[(i-1)*length(dem)+k, 4:6] <-rr
+    
+    # EXTRACT COEF/VCOV for ATTR ---- #
+    coef_list3[(i-1)*length(dem)+k,] <- coef(red); vcov_list3[[(i-1)*length(dem)+k]] <- vcov(red)
+    cb_list3[[(i-1)*length(dem)+k]] <- cb
+    t75_list3[(i-1)*length(dem)+k,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    
+    
+    ## [2. GET ROR] ====================================================== @
+    int1 <- cb*ldat2$DSB
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_4[(i-1)*length(dem)+k,7:9] <-rr
+    
+    
+    ## [PwoD RR] ----------------------- @
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_4[(i-1)*length(dem)+k,10:12] <-rr
+
+    coef_list3_pwod[(i-1)*length(dem)+k,] <- coef(red); vcov_list3_pwod[[(i-1)*length(dem)+k]] <- vcov(red)
+    cb_list3_pwod[[(i-1)*length(dem)+k]] <- cb
+    t75_list3_pwod[(i-1)*length(dem)+k,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
+    rm(int1, model)
+  }
+}
+rm(ldat2, cb, predvar, bvar, red, pred, rr)
+save(coef_list3, vcov_list3, cb_list3, t75_list3, file="Results/analysis_result/list3_income.RData")
+fwrite(rtable4_4, "Results/Revision/240528_RRTABLE4_income.csv")
+#fwrite(rtable4_4, "Results/Revision/240531_RRTABLE4_income_pwod.csv")
+rm(coef_list3, vcov_list3, cb_list3, t75_list3)
+
+# save(coef_list3_pwod, vcov_list3_pwod, cb_list3_pwod, t75_list3_pwod, file="Results/analysis_result/list3_income_pwod.RData")
+# rm(coef_list3_pwod, vcov_list3_pwod, cb_list3_pwod, t75_list3_pwod)
+
+
+# (5) URBAN SUB ----------------------------------
+dem <- c("Rural", "Urban")
+rtable4_5 <- data.frame(population=rep(names(dat_type), each=length(dem)),
+                        demo=dem, cause_of_visit="All cause", 
+                        RR=NA, RR_low=NA, RR_high=NA,
+                        ROR=NA, ROR_low=NA, ROR_high=NA)
+
+for (i in 2:(length(dat_type))){
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  cat(names(dat_type)[[i]])
+  
+  for (k in seq(length(dem))){
+    cat(dem[[k]])
+    ldat2 <- ldat %>% filter(ur==dem[k])
+    tsub <- ldat2 %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+    tknots <- quantile(ldat2$lag0_temp, c(25,50,75)/100, na.rm=T)
+    cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+    rm(tsub); gc()
+    
+    predvar<-quantile(ldat2$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+    bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+    
+    ## [1. GET RR] ====================================================== @
+    int1 <- cb*ldat2$nonDSB
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    rm(int1, model)
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_5[(i-1)*length(dem)+k, 4:6] <-rr
+    
+    
+    ## [2. GET ROR] ====================================================== @
+    int1 <- cb*ldat2$DSB
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + num_dr + num_bed +
+                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    
+    red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+    pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                    cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+    
+    # EXTRACT RR / coef/vcov ---- #
+    rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+    rtable4_5[(i-1)*length(dem)+k,7:9] <-rr
+    rm(int1, model)
+  }
+}
+rm(ldat2, cb, predvar, bvar, red, pred, rr)
+fwrite(rtable4_5, "Results/Revision/240528_RRTABLE4_ur2.csv")
+gc()
+
+
+#=############################################################################=#
+## 3. SENSITIVITY ANALYSIS #####################################################
+#=############################################################################=#
+## CASE DATA ---------------------------------- #
+# dat_type 이어서 활용하기
+
+## 1) MODEL SETTING CHANGE =====================================
+# temp data 이어서 활용하기
+
+# (1) LAG MAX: 3 DAYS ------------------
+rtable_s01 <- data.frame(population=names(dat_type),
+                         cause_of_visit="All cause",
+                         expo="LAG3_knots1",
+                         RR=rep(NA), RR_low=rep(NA), RR_high=rep(NA))
+
+varfun<-"ns"; vardf<-4 ; lagknots<-c(1) #among lag days
+
+for (i in 2:(length(dat_type))){ #each disability type
+  cat(names(dat_type)[i])
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  
+  tsub <- ldat %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+  cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+  rm(tsub); gc()
+  
+  predvar<-quantile(ldat$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+  bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+  
+  ## [1. GET RR] ====================================================== @
+  int1 <- cb*ldat$nonDSB
+  model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  
+  red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+  pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                  cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
+  rm(int1, model)
+  
+  # EXTRACT RR / coef/vcov ---- #
+  rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+  rtable_s01[i,4:6] <-rr
+}
+
+rm(ldat, cb, predvar, bvar, red, pred, rr)
+fwrite(rtable_s01, "Results/Revision/240528_RTABLE_S1.csv")
+
+
+# (2) LAG MAX: 7 DAYS ------------------
+rm(temp0621)
+load("temp0621_percentile_REV.RData") %>% data.table()
+temp0621 <- temp0621_0609; rm(temp0621_0609, temp0621_0509)
+temp0621$date <- as.Date(temp0621$date)
+
+# APPLY LAG TEMPERATURE
+temp0621 <- temp0621 %>% mutate(year=year(date),
+                                lag1_temp=temp_rank %>% Lag(1, group=list(sgg_b,year)),
+                                lag2_temp=temp_rank %>% Lag(2, group=list(sgg_b,year)),
+                                lag3_temp=temp_rank %>% Lag(3, group=list(sgg_b,year)),
+                                lag4_temp=temp_rank %>% Lag(4, group=list(sgg_b,year)),
+                                lag5_temp=temp_rank %>% Lag(5, group=list(sgg_b,year)),
+                                lag6_temp=temp_rank %>% Lag(6, group=list(sgg_b,year)),
+                                lag7_temp=temp_rank %>% Lag(7, group=list(sgg_b,year))) %>%
+  select(-year) %>% rename(lag0_temp=temp_rank)
+
+
+rtable_s02 <- data.frame(population=names(dat_type),
+                         cause_of_visit="All cause",
+                         expo="LAG7_knots2",
+                         RR=rep(NA), RR_low=rep(NA), RR_high=rep(NA))
+
+varfun<-"ns"; vardf<-4 ; lagknots<-c(1, 3) #among lag days
+
+
+for (i in 2:(length(dat_type))){ #each disability type
+  cat(names(dat_type)[i])
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  
+  tsub <- ldat %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+  cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+  rm(tsub); gc()
+  
+  predvar<-quantile(ldat$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+  bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+  
+  ## [1. GET RR] ====================================================== @
+  int1 <- cb*ldat$nonDSB
+  model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  
+  red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+  pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                  cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
+  rm(int1, model)
+  
+  # EXTRACT RR / coef/vcov ---- #
+  rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+  rtable_s02[i,4:6] <-rr
+}
+
+rm(ldat, cb, predvar, bvar, red, pred, rr)
+fwrite(rtable_s02, "Results/Revision/240528_RTABLE_S2.csv")
+
+
+## 2) TEMPERATURE ITSELF =====================================
+## TEMPERATURE DATA LOAD ---------------------------------- #
+rm(temp0621)
+load("temp0621_percentile_REV.RData") %>% data.table()
+temp0621 <- temp0621_0609; rm(temp0621_0609, temp0621_0509)
+temp0621$date <- as.Date(temp0621$date)
+
+# APPLY LAG TEMPERATURE
+temp0621 <- temp0621 %>% mutate(year=year(date),
+                                lag1_temp=tmean %>% Lag(1, group=list(sgg_b,year)),
+                                lag2_temp=tmean %>% Lag(2, group=list(sgg_b,year)),
+                                lag3_temp=tmean %>% Lag(3, group=list(sgg_b,year)),
+                                lag4_temp=tmean %>% Lag(4, group=list(sgg_b,year)),
+                                lag5_temp=tmean %>% Lag(5, group=list(sgg_b,year))) %>%
+  select(-year) %>% rename(lag0_temp=tmean)
+
+# [CONDUCT ANALYSIS] ----- #
+rtable_s03 <- data.frame(population=names(dat_type),
+                        cause_of_visit="All cause",
+                        expo="temperature value",
+                        RR=rep(NA), RR_low=rep(NA), RR_high=rep(NA))
+
+varfun<-"ns"; vardf<-4 ; lagknots<-c(1,3) #among lag days
+
+
+for (i in 2:(length(dat_type))){ #each disability type
+  cat(names(dat_type)[i])
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  
+  tsub <- ldat %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+  cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+  rm(tsub); gc()
+  
+  predvar<-quantile(ldat$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+  bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+  
+  ## [1. GET RR] ====================================================== @
+  int1 <- cb*ldat$nonDSB
+  model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  
+  red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+  pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                  cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
+  rm(int1, model)
+  
+  # EXTRACT RR / coef/vcov ---- #
+  rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+  rtable_s03[i,4:6] <-rr
+}
+
+rm(ldat, cb, predvar, bvar, red, pred, rr)
+fwrite(rtable_s03, "Results/Revision/240528_RTABLE_S3.csv")
+
+
+
+## 3) PERIOD CHANGE =====================================
+## CASE DATA ---------------------------------- #
+rm(list=ls()); gc()
+load("00_DBsave_R/240524_PwD+PwoD_matched2.RData")#장애인, 5-9월, INFJ / list form
+load("meteo(preci+rhum).RData")
+
+# [SEPARATE RESULT TABLE] ----- #
+dat_type <- dat_type_matched %>% lapply(function(x){
+  x <- x %>% mutate(month=month(MATCHED_DATE)) %>% filter(month %in% 5:9) %>% select(-month)
+  x <- x %>% select(c(ID, CASE_YN, sick, SEX_TYPE, MAIN_DSB_TYPE, sgg_b, MATCHED_DATE, holiday,
+                      ur, DENS_rank, num_dr:senior, sick_detail:nonDSB))
+  x$holiday <- as.factor(x$holiday)
+  return(x)
+}); rm(dat_type_matched)
+
+
+## TEMPERATURE DATA LOAD ---------------------------------- #
+load("temp0621_percentile_REV.RData") %>% data.table()
+temp0621 <- temp0621_0509; rm(temp0621_0609, temp0621_0509)
+temp0621$date <- as.Date(temp0621$date)
+
+# APPLY LAG TEMPERATURE
+temp0621 <- temp0621 %>% mutate(year=year(date),
+                                lag1_temp=temp_rank %>% Lag(1, group=list(sgg_b,year)),
+                                lag2_temp=temp_rank %>% Lag(2, group=list(sgg_b,year)),
+                                lag3_temp=temp_rank %>% Lag(3, group=list(sgg_b,year)),
+                                lag4_temp=temp_rank %>% Lag(4, group=list(sgg_b,year)),
+                                lag5_temp=temp_rank %>% Lag(5, group=list(sgg_b,year))) %>%
+  select(-year) %>% rename(lag0_temp=temp_rank)
+
+# [CONDUCT ANALYSIS] ----- #
+rtable_s04 <- data.frame(population=names(dat_type),
+                        cause_of_visit="All cause",
+                        expo="lag 0-5+MaySep",
+                        RR=rep(NA), RR_low=rep(NA), RR_high=rep(NA))
+varfun<-"ns"; vardf<-4 ; lagknots<-c(1,3) #among lag days
+
+
+
+for (i in 2:(length(dat_type))){ #each disability type
+  cat(names(dat_type)[i])
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  
+  tsub <- ldat %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+  cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+  rm(tsub); gc()
+  
+  predvar<-quantile(ldat$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+  bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+  
+  ## [1. GET RR] ====================================================== @
+  int1 <- cb*ldat$nonDSB
+  model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  
+  red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+  pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                  cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
+  rm(int1, model)
+  
+  # EXTRACT RR / coef/vcov ---- #
+  rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+  rtable_s04[i,4:6] <-rr
+}
+
+rm(ldat, cb, predvar, bvar, red, pred, rr)
+fwrite(rtable_s04, "Results/Revision/240531_RTABLE_S4.csv")
+
+
+
+##############################################################################=#
+### 4. PREP REVISION ###########################################################
+##############################################################################=#
+## CASE DATA ---------------------------------- #
+rm(list=ls()); gc()
+
+load("00_DBsave_R/240524_PwD+PwoD_matched2.RData")
+
+# [SEPARATE RESULT TABLE] ----- #
+dat_type <- dat_type_matched %>% lapply(function(x){
+  x <- x %>% mutate(month=month(MATCHED_DATE)) %>% filter(month %in% 6:9) %>% select(-month)
+  x <- x %>% select(c(ID, CASE_YN, sick, SEX_TYPE, MAIN_DSB_TYPE, sgg_b, MATCHED_DATE, holiday,
+                      ur, DENS_rank, num_dr:senior, sick_detail:nonDSB))
+  x$holiday <- as.factor(x$holiday)
+  return(x)
+}); rm(dat_type_matched)
+
+## TEMPERATURE DATA LOAD ---------------------------------- #
+load("meteo(preci+rhum).RData")
+load("temp0621_percentile_REV.RData") %>% data.table()
+temp0621 <- temp0621_0509; rm(temp0621_0609, temp0621_0509)
+temp0621$date <- as.Date(temp0621$date)
+
+# APPLY LAG TEMPERATURE
+temp0621 <- temp0621 %>% mutate(year=year(date),
+                                lag1_temp=temp_rank %>% Lag(1, group=list(sgg_b,year)),
+                                lag2_temp=temp_rank %>% Lag(2, group=list(sgg_b,year)),
+                                lag3_temp=temp_rank %>% Lag(3, group=list(sgg_b,year)),
+                                lag4_temp=temp_rank %>% Lag(4, group=list(sgg_b,year)),
+                                lag5_temp=temp_rank %>% Lag(5, group=list(sgg_b,year))) %>%
+  select(-year) %>% rename(lag0_temp=temp_rank)
+
+# [SEPARATE RESULT TABLE] ----- #
+rtable_s05 <- data.frame(population=rep(names(dat_type), each=3),
+                      cause_of_visit="All cause",
+                      expo=c("50vs99", "75vs95", "50 vs 95"),
+                      RR=rep(NA), RR_low=rep(NA), RR_high=rep(NA), SE=rep(NA))
+varfun<-"ns"; vardf<-4 ; lagknots<-c(1,3) #among lag days
+
+# [CONDUCT ANALYSIS] ----- #
+
+for (i in 2:(length(dat_type))){ #each disability type
+  cat(names(dat_type)[i])
+  ldat <- dat_type[[i]]
+  ldat <- ldat %>% left_join(temp0621, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% 
+    left_join(meteo, by=c("MATCHED_DATE"="date", "sgg_b"="sgg_b")) %>% as_tibble()
+  
+  tsub <- ldat %>% select(c(lag0_temp, lag1_temp:lag5_temp))
+  cb <- crossbasis(tsub, argvar=list(fun=varfun, df=vardf), arglag=list(knots=lagknots)) #WHL
+  rm(tsub); gc()
+  
+  predvar<-quantile(ldat$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
+  bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
+  
+  ## [1. GET RR] ====================================================== @
+  int1 <- cb*ldat$nonDSB
+  model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
+                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  
+  for (m in c(1,2,3)){
+    if (m==1){ #50 vs 99
+      red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,50/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+      pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                      cen=quantile(unique(ldat$lag0_temp),50/100, na.rm=T))
+      rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh, allse))[100,] %>% as.vector()
+    }
+    
+    if (m==2){ #75 vs 95
+      red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T))
+      pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                      cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
+      rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh, allse))[96,] %>% as.vector()
+    }
+    
+    if (m==3){ #50 vs 95
+      ## (2) PLOT WITH DLNM FUNCTION ---------------------------------------#
+      red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,50/100, na.rm=T))
+      pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                      cen=quantile(unique(ldat$lag0_temp),50/100, na.rm=T))
+      rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh, allse))[96,] %>% as.vector()
+    }
+    
+    ## (3) EXTRACT RR / coef/vcov -----------------------------------------------#
+    rtable_s05[(i-1)*3+m,4:6] <-rr
+  }
+}
+
+rm(ldat, cb, predvar, bvar, red, pred, rr, int1, model)
+fwrite(rtable_s05, "Results/Revision/240531_RTABLE_S5.csv")
