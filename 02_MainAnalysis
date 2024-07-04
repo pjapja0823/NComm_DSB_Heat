@@ -52,20 +52,13 @@ load("meteo(preci+rhum).RData")
 rtable1 <- data.frame(population=names(dat_type),
                       cause_of_visit="All cause", expo="lag 0-5",
                       RR=NA, RR_low=NA, RR_high=NA,
-                      ROR=NA, ROR_low=NA, ROR_high=NA)
+                      ROR=NA, ROR_low=NA, ROR_high=NA,
+                      PwoD=NA, PwoD_low=NA, PwoD_high=NA)
 
 vcov_list1 <- cb_list1 <- vector("list", length=length(dat_type))
 coef_list1 <- matrix(NA, nrow=length(dat_type), ncol=vardf)
 t75_list1 <- matrix(NA, nrow=length(dat_type), ncol=1)
 rownames(t75_list1) <- rownames(coef_list1) <- names(vcov_list1) <- names(cb_list1) <- names(dat_type)
-
-# FOR PwoD --------------- #
-vcov_list_pwod <- cb_list_pwod <- vector("list", length=1)
-coef_list_pwod <- matrix(NA, nrow=1, ncol=vardf)
-t75_list_pwod <- matrix(NA, nrow=1, ncol=1)
-rownames(t75_list_pwod) <- rownames(coef_list_pwod) <- names(vcov_list_pwod) <- names(cb_list_pwod) <- "pwodal"
-# ----------------------------- #
-
 
 # [CONDUCT ANALYSIS] ----- #
 for (i in seq(length(dat_type))){ #each disability type
@@ -100,11 +93,8 @@ for (i in seq(length(dat_type))){ #each disability type
   # EXTRACT COEF/VCOV for ATTR ---- #
   coef_list1[i,] <- coef(red); vcov_list1[[i]] <- vcov(red); cb_list1[[i]] <- cb
   t75_list1[i,] <- quantile(ldat$lag0_temp,75/100, na.rm=T)
-  
-  # coef_list_tot[i,] <- coef(red); vcov_list_tot[[i]] <- vcov(red); cb_list_tot[[i]] <- cb
-  # t75_list_tot[i,] <- quantile(ldat$lag0_temp,75/100, na.rm=T)
 
-    
+
   ## [2. GET ROR] ====================================================== @
   int1 <- cb*ldat$DSB
   model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
@@ -117,31 +107,19 @@ for (i in seq(length(dat_type))){ #each disability type
   # EXTRACT RR / coef/vcov ---- #
   rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
   rtable1[i,7:9] <-rr
-  
-  
+
   ## [PwoD RR] ----------------------- @
-  # red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
-  # pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
-  #                 cen=quantile(unique(ldat$lag0_temp),75/100, na.rm=T))
-  # rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
-  # rtable1[i,10:12] <-rr
-  # rm(int1, model)
-  
-  # coef_list_pwod[i,] <- coef(red); vcov_list_pwod[[i]] <- vcov(red)
-  # cb_list_pwod[[i]] <- cb
-  # t75_list_pwod[i,] <- quantile(ldat$lag0_temp,75/100, na.rm=T)
+  red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
+  pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
+                  cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
+  rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
+  rtable1[i,10:12] <-rr
 }
 
 rm(cb, predvar, bvar, red, pred, rr, int1, model)
 fwrite(rtable1, "Results/Revision/240528_RRTABLE1.csv")
-#fwrite(rtable1, "Results/Revision/240528_RRTABLE1_tot.csv")
 save(coef_list1, vcov_list1, cb_list1, t75_list1, file="Results/analysis_result/list1_v2.RData")
 rm(coef_list1, vcov_list1, cb_list1, t75_list1)
-
-# save(coef_list_tot, vcov_list_tot, cb_list_tot, t75_list_tot, file="Results/analysis_result/list_tot_v2_total.RData")
-# rm(coef_list_tot, vcov_list_tot, cb_list_tot, t75_list_tot)
-save(coef_list_pwod, vcov_list_pwod, cb_list_pwod, t75_list_pwod, file="Results/analysis_result/list_tot_pwod.RData")
-rm(coef_list_pwod, vcov_list_pwod, cb_list_pwod, t75_list_pwod)
 gc()
 
 
@@ -151,7 +129,8 @@ cause_nm <- c("Cardiovascular", "Genitourinary", "Mental", "Respiratory")
 rtable2 <- data.frame(population=rep(names(dat_type), each=4),
                       cause_of_visit=cause_nm, expo="lag 0-5",
                       RR=NA, RR_low=NA, RR_high=NA,
-                      ROR=NA, ROR_low=NA, ROR_high=NA)
+                      ROR=NA, ROR_low=NA, ROR_high=NA,
+                      PwoD=NA, PwoD_low=NA, PwoD_high=NA)
 
 NMlist <- paste(rtable2$population, rtable2$cause_of_visit, sep="_")
 
@@ -159,12 +138,6 @@ vcov_list2 <- cb_list2 <- vector("list", length=length(dat_type)*4)
 coef_list2 <- matrix(NA, nrow=length(dat_type)*4, ncol=vardf)
 t75_list2 <- matrix(NA, nrow=length(dat_type)*4, ncol=1)
 rownames(t75_list2) <- rownames(coef_list2) <- names(vcov_list2) <- names(cb_list2) <- NMlist
-#load("Results/analysis_result/list2_v2.RData")
-
-vcov_list2_pwod <- cb_list2_pwod <- vector("list", length=length(cause))
-coef_list2_pwod <- matrix(NA, nrow=length(cause), ncol=vardf)
-t75_list2_pwod <- matrix(NA, nrow=length(cause), ncol=1)
-rownames(t75_list2_pwod) <- rownames(coef_list2_pwod) <- names(vcov_list2_pwod) <- names(cb_list2_pwod) <- cause_nm
 
 
 for (i in seq(length(dat_type))){
@@ -221,10 +194,6 @@ for (i in seq(length(dat_type))){
                     cen=quantile(unique(ldat2$lag0_temp),75/100, na.rm=T))
     rr <- with(pred, cbind(allRRfit, allRRlow, allRRhigh))[100,] %>% as.vector()
     rtable2[(i-1)*4+m,10:12] <-rr
-
-    coef_list2_pwod[(i-1)*4+m,] <- coef(red); vcov_list2_pwod[[(i-1)*4+m]] <- vcov(red); cb_list2_pwod[[(i-1)*4+m]] <- cb
-    t75_list2_pwod[(i-1)*4+m,] <- quantile(ldat2$lag0_temp,75/100, na.rm=T)
-    rm(int1, model)
   }
 }
 
