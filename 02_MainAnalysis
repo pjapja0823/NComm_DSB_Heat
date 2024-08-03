@@ -17,7 +17,7 @@ load("00_DBsave_R/240524_PwD+PwoD_matched2.RData")
 dat_type <- dat_type_matched %>% lapply(function(x){
   x <- x %>% mutate(month=month(MATCHED_DATE)) %>% filter(month %in% 6:9) %>% select(-month)
   x <- x %>% select(c(ID, CASE_YN, sick, SEX_TYPE, MAIN_DSB_TYPE, sgg_b, MATCHED_DATE, holiday,
-                      ur, DENS_rank, num_dr:senior, sick_detail:nonDSB))
+                      DENS_rank, senior, incomeLv, sick_detail:nonDSB))
   x$holiday <- as.factor(x$holiday)
   return(x)
 }); rm(dat_type_matched)
@@ -73,13 +73,11 @@ for (i in seq(length(dat_type))){ #each disability type
   
   predvar<-quantile(ldat$lag0_temp,c(0.001,1:99/100,0.999),na.rm=T)
   bvar<-onebasis(predvar,fun=varfun,knots=predvar[c(25,50,75)+1]) #df=4(equal knots)?
-  ldat <- ldat %>%
-    select(c(ID, CASE_YN, lag0_temp, nonDSB, DSB, ur, DENS_rank, num_dr, num_bed, unmet, medicaid, insu_rank2, rhum, holiday))
+  ldat <- ldat %>% select(c(ID, CASE_YN, lag0_temp, nonDSB, DSB, rhum, holiday))
   
   ## [1. GET RR] ====================================================== @
   int1 <- cb*ldat$nonDSB
-  model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
-                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ns(rhum, df=3) + strata(ID), data=ldat)
   
   red<-crossreduce(cb,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
   pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
@@ -97,8 +95,7 @@ for (i in seq(length(dat_type))){ #each disability type
 
   ## [2. GET ROR] ====================================================== @
   int1 <- cb*ldat$DSB
-  model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
-                    unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat)
+  model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ns(rhum, df=3) + strata(ID), data=ldat)
   
   red<-crossreduce(int1,model, cen=quantile(ldat$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
   pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
@@ -157,8 +154,7 @@ for (i in seq(length(dat_type))){
     
     ## [1. GET RR] ====================================================== @
     int1 <- cb*ldat2$nonDSB
-    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
-                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ns(rhum, df=3) + strata(ID), data=ldat2)
 
     red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
     pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
@@ -176,8 +172,7 @@ for (i in seq(length(dat_type))){
     
     ## [2. GET ROR] ====================================================== @
     int1 <- cb*ldat2$DSB
-    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
-                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ns(rhum, df=3) + strata(ID), data=ldat2)
     
     red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
     pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
@@ -239,8 +234,7 @@ for (i in seq(length(dat_type))){
     
     ## [1. GET RR] ====================================================== @
     int1 <- cb*ldat2$nonDSB
-    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
-                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    model <- clogit(CASE_YN ~ cb + nonDSB + int1 + holiday + ns(rhum, df=3) + strata(ID), data=ldat2)
     
     red<-crossreduce(cb,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
     pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
@@ -259,8 +253,7 @@ for (i in seq(length(dat_type))){
     
     ## [2. GET ROR] ====================================================== @
     int1 <- cb*ldat2$DSB
-    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ur + DENS_rank + num_dr + num_bed +
-                      unmet + medicaid + insu_rank2 + ns(rhum, df=3) + strata(ID), data=ldat2)
+    model <- clogit(CASE_YN ~ cb + DSB + int1 + holiday + ns(rhum, df=3) + strata(ID), data=ldat2)
     
     red<-crossreduce(int1,model, cen=quantile(ldat2$lag0_temp,75/100, na.rm=T)) #Overall lag-cumulative coef, vcov
     pred<-crosspred(bvar,coef=coef(red),vcov=vcov(red),model.link="logit",at=predvar,
