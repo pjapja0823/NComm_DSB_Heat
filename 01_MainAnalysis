@@ -10,7 +10,7 @@ library(lubridate); library(data.table); library(dplyr); library(readxl)
 library(tsModel); library(dlnm); library(survival); library(splines)
 
 load("00_DBsave_R/240524_PwD+PwoD_matched2.RData")
-# Check the attached dataset (which were formed for individual-level case-crossover study)
+# The dataset should be prepared for individual-level case-crossover study design (duplicated; long-form)
 
 
 # [SEPARATE RESULT TABLE] ----- #
